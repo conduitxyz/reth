@@ -83,6 +83,15 @@ pub trait Table: Send + Sync + Debug + 'static {
     /// Whether the table is also a `DUPSORT` table.
     const DUPSORT: bool;
 
+    /// Whether the table opts into MDBX `DUP_FIXED` storage for its (fixed-size) duplicate
+    /// values.
+    ///
+    /// This is only meaningful for `DUPSORT` tables whose value compresses to a constant byte
+    /// length. When `true` *and* the process-wide dup-fixed gate is enabled (see
+    /// `reth-db`'s `dupfixed` module), the table is created with `DUP_FIXED` and its values are
+    /// stored as fixed-width 64-byte records. Defaults to `false` (stock behaviour).
+    const DUPFIXED: bool = false;
+
     /// Key element of `Table`.
     ///
     /// Sorting should be taken into account when encoding this.
@@ -99,6 +108,13 @@ pub trait TableInfo: Send + Sync + Debug + 'static {
 
     /// Whether the table is a `DUPSORT` table.
     fn is_dupsort(&self) -> bool;
+
+    /// Whether the table opts into MDBX `DUP_FIXED` storage.
+    ///
+    /// Defaults to `false` so external [`TableInfo`] implementors are unaffected.
+    fn is_dupfixed(&self) -> bool {
+        false
+    }
 }
 
 /// Tuple with `T::Key` and `T::Value`.

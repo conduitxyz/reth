@@ -1,6 +1,6 @@
 //! Cursor wrapper for libmdbx-sys.
 
-use super::utils::*;
+use super::{dupfixed, utils::*};
 use crate::{
     metrics::{Operation, TableOperationMetrics},
     DatabaseError,
@@ -78,7 +78,15 @@ where
 /// allocated buffer when we can just use their reference.
 macro_rules! compress_to_buf_or_ref {
     ($self:expr, $value:expr) => {
-        if let Some(value) = $value.uncompressable_ref() {
+        if T::DUPFIXED && dupfixed::enabled() {
+            // Fixed-width path: compress normally, then expand to a constant 64 bytes so the
+            // value is legal under MDBX `DUP_FIXED`. Always uses the buffer (StorageEntry is not
+            // uncompressable).
+            $self.buf.clear();
+            $value.compress_to_buf(&mut $self.buf);
+            dupfixed::expand_buf(&mut $self.buf);
+            None
+        } else if let Some(value) = $value.uncompressable_ref() {
             Some(value)
         } else {
             $self.buf.clear();
@@ -196,8 +204,10 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         key: <T as Table>::Key,
         subkey: <T as DupSort>::SubKey,
     ) -> ValueOnlyResult<T> {
+        let subkey = subkey.encode();
+        let subkey = dupfixed::pad_seek_subkey::<T>(subkey.as_ref());
         self.inner
-            .get_both_range(key.encode().as_ref(), subkey.encode().as_ref())
+            .get_both_range(key.encode().as_ref(), subkey.as_ref())
             .map_err(|e| DatabaseError::Read(e.into()))?
             .map(decode_one::<T>)
             .transpose()
@@ -216,8 +226,10 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
         let start = match (key, subkey) {
             (Some(key), Some(subkey)) => {
                 let encoded_key = key.encode();
+                let subkey = subkey.encode();
+                let subkey = dupfixed::pad_seek_subkey::<T>(subkey.as_ref());
                 self.inner
-                    .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
+                    .get_both_range(encoded_key.as_ref(), subkey.as_ref())
                     .map_err(|e| DatabaseError::Read(e.into()))?
                     .map(|val| decoder::<T>((Cow::Borrowed(encoded_key.as_ref()), val)))
             }
@@ -231,8 +243,10 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
             (None, Some(subkey)) => {
                 if let Some((key, _)) = self.first()? {
                     let encoded_key = key.encode();
+                    let subkey = subkey.encode();
+                    let subkey = dupfixed::pad_seek_subkey::<T>(subkey.as_ref());
                     self.inner
-                        .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
+                        .get_both_range(encoded_key.as_ref(), subkey.as_ref())
                         .map_err(|e| DatabaseError::Read(e.into()))?
                         .map(|val| decoder::<T>((Cow::Borrowed(encoded_key.as_ref()), val)))
                 } else {

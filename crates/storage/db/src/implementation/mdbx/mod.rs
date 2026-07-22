@@ -32,6 +32,7 @@ use std::{
 use tx::Tx;
 
 pub mod cursor;
+pub mod dupfixed;
 pub mod tx;
 
 mod utils;
@@ -593,8 +594,15 @@ impl DatabaseEnv {
         let tx = self.inner.begin_rw_txn().map_err(|e| DatabaseError::InitTx(e.into()))?;
 
         for table in TS::tables() {
-            let flags =
+            let mut flags =
                 if table.is_dupsort() { DatabaseFlags::DUP_SORT } else { DatabaseFlags::default() };
+
+            // Opt a fixed-size dupsort table into MDBX `DUP_FIXED` when the process-wide gate is
+            // enabled (see the `dupfixed` module). Default (gate off) is byte-identical to stock
+            // reth: plain `DUP_SORT` with compact values.
+            if table.is_dupfixed() && dupfixed::enabled() {
+                flags |= DatabaseFlags::DUP_FIXED;
+            }
 
             let db = tx
                 .create_db(Some(table.name()), flags)
@@ -670,7 +678,8 @@ mod tests {
     use super::*;
     use crate::{
         tables::{
-            AccountsHistory, CanonicalHeaders, Headers, PlainAccountState, PlainStorageState,
+            AccountsHistory, CanonicalHeaders, HashedStorages, Headers, PlainAccountState,
+            PlainStorageState,
         },
         test_utils::*,
         AccountChangeSets,
@@ -817,6 +826,107 @@ mod tests {
 
         // Check the remainder of walker
         assert!(walker.next().is_none());
+    }
+
+    #[test]
+    fn db_dup_fixed_hashed_storages_roundtrip() {
+        use super::dupfixed;
+        use reth_db_api::cursor::{DbCursorRO, DbDupCursorRO};
+
+        // Turn the process-wide gate ON so `HashedStorages`/`PlainStorageState` are created with
+        // MDBX `DUP_FIXED` and their values are stored as fixed 64-byte records.
+        dupfixed::set_enabled(true);
+        assert!(HashedStorages::DUPFIXED, "HashedStorages must opt into DUP_FIXED");
+        assert!(dupfixed::enabled(), "gate must be enabled for this test");
+
+        let (_tempdir, db) = create_test_db(DatabaseEnvKind::RW);
+
+        // Several accounts, each with several slots. Values deliberately include zero, small,
+        // one-full-limb, a value with an interior/high zero byte, and U256::MAX to exercise the
+        // fixed-width codec's zero-padding both ways.
+        let accounts =
+            [B256::with_last_byte(1), B256::with_last_byte(2), B256::repeat_byte(0xcd)];
+        let values = [
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(0x0100u64),
+            U256::from(u64::MAX),
+            U256::from(1u64) << 200,
+            U256::MAX,
+        ];
+
+        // Build the expected (account, entry) set, with subkeys distinct per slot index.
+        let subkey = |i: usize| B256::with_last_byte(0x10 + i as u8);
+        let mut expected: Vec<(B256, StorageEntry)> = Vec::new();
+        for acc in accounts {
+            for (i, v) in values.iter().enumerate() {
+                expected.push((acc, StorageEntry { key: subkey(i), value: *v }));
+            }
+        }
+        // MDBX orders (key, then duplicate value) lexicographically. Under DUP_FIXED duplicates
+        // sort by the 64-byte record, i.e. subkey first then value; subkeys are distinct so this
+        // is subkey order. Accounts (the outer key) sort by their bytes.
+        expected.sort_by(|(a, ea), (b, eb)| a.cmp(b).then(ea.key.cmp(&eb.key)));
+
+        // Insert everything (upsert appends duplicates under each account key).
+        {
+            let tx = db.tx_mut().expect(ERROR_INIT_TX);
+            let mut cursor = tx.cursor_dup_write::<HashedStorages>().unwrap();
+            for (acc, entry) in &expected {
+                cursor.upsert(*acc, entry).expect(ERROR_UPSERT);
+            }
+            tx.commit().expect(ERROR_COMMIT);
+        }
+
+        let tx = db.tx().expect(ERROR_INIT_TX);
+        let mut cursor = tx.cursor_dup_read::<HashedStorages>().unwrap();
+
+        // 1) A full table walk (crossing keys and duplicates) must return every entry, in order,
+        //    byte-identical after round-trip.
+        let all = cursor.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(all, expected, "full walk must round-trip all entries in order");
+
+        // walk_dup(None, None) walks only the first key's duplicates (stock DUP_SORT semantics via
+        // MDBX_NEXT_DUP); confirm that is unchanged under DUP_FIXED.
+        let first_key_dups =
+            cursor.walk_dup(None, None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let expected_first: Vec<_> =
+            expected.iter().filter(|(a, _)| *a == accounts[0]).copied().collect();
+        assert_eq!(first_key_dups, expected_first, "walk_dup(None,None) must cover first key only");
+
+        // 2) seek_by_key_subkey must find the exact entry for each (account, subkey) - this is the
+        //    cursor operation the trie walks rely on.
+        for (acc, entry) in &expected {
+            let found = cursor
+                .seek_by_key_subkey(*acc, entry.key)
+                .expect("seek_by_key_subkey must succeed under DUP_FIXED")
+                .expect("entry must be found");
+            assert_eq!(found, *entry, "seek_by_key_subkey returned wrong/altered value");
+        }
+
+        // 3) walk_dup restricted to a single account, plus next_dup_val ordering.
+        for acc in accounts {
+            let per_account: Vec<_> = expected
+                .iter()
+                .filter(|(a, _)| *a == acc)
+                .map(|(_, e)| *e)
+                .collect();
+            let walked = cursor
+                .walk_dup(Some(acc), None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let walked_values: Vec<_> = walked.into_iter().map(|(_, e)| e).collect();
+            assert_eq!(walked_values, per_account, "per-account walk_dup order/values wrong");
+        }
+
+        // 4) A subkey that lies between stored subkeys: seek_by_key_subkey returns the next entry
+        //    whose subkey >= the requested one (unchanged semantics vs plain DUP_SORT).
+        let between = B256::with_last_byte(0x10 + values.len() as u8); // just past the last subkey
+        let past_end = cursor.seek_by_key_subkey(accounts[0], between).unwrap();
+        assert!(past_end.is_none(), "no entry should have subkey >= just-past-last for this account");
+
+        // Leave the gate enabled; other tests round-trip correctly regardless of gate state.
     }
 
     #[test]

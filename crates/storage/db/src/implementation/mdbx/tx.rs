@@ -1,6 +1,6 @@
 //! Transaction wrapper for libmdbx-sys.
 
-use super::{cursor::Cursor, utils::*};
+use super::{cursor::Cursor, dupfixed, utils::*};
 use crate::{
     metrics::{DatabaseEnvMetrics, Operation, TransactionMode, TransactionOutcome},
     DatabaseError,
@@ -14,6 +14,7 @@ use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
 use reth_tracing::tracing::{debug, instrument, trace, warn};
 use std::{
     backtrace::Backtrace,
+    borrow::Cow,
     collections::HashMap,
     marker::PhantomData,
     sync::{
@@ -381,9 +382,17 @@ impl Tx<RW> {
     ) -> Result<(), DatabaseError> {
         let key = key.encode();
         let value = value.compress();
+        // Under `DUP_FIXED` the compressed value must be a constant 64 bytes.
+        let value: Cow<'_, [u8]> = if T::DUPFIXED && dupfixed::enabled() {
+            let mut v = value.as_ref().to_vec();
+            dupfixed::expand_buf(&mut v);
+            Cow::Owned(v)
+        } else {
+            Cow::Borrowed(value.as_ref())
+        };
         let (operation, write_operation, flags) = kind.into_operation_and_flags();
         self.execute_with_operation_metric::<T, _>(operation, Some(value.as_ref().len()), |tx| {
-            tx.put(self.get_dbi::<T>()?, key.as_ref(), value, flags).map_err(|e| {
+            tx.put(self.get_dbi::<T>()?, key.as_ref(), value.as_ref(), flags).map_err(|e| {
                 DatabaseWriteError {
                     info: e.into(),
                     operation: write_operation,
@@ -413,11 +422,22 @@ impl DbTxMut for Tx<RW> {
         key: T::Key,
         value: Option<T::Value>,
     ) -> Result<bool, DatabaseError> {
-        let mut data = None;
-
         let value = value.map(Compress::compress);
-        if let Some(value) = &value {
-            data = Some(value.as_ref());
+        // Under `DUP_FIXED` the stored value is a constant 64 bytes; the delete key must match
+        // that representation to remove the correct duplicate. Only allocate when gated on.
+        let expanded: Option<Vec<u8>> = if T::DUPFIXED && dupfixed::enabled() {
+            value.as_ref().map(|v| {
+                let mut b = v.as_ref().to_vec();
+                dupfixed::expand_buf(&mut b);
+                b
+            })
+        } else {
+            None
+        };
+        let data: Option<&[u8]> = match (&expanded, &value) {
+            (Some(e), _) => Some(e.as_slice()),
+            (None, Some(v)) => Some(v.as_ref()),
+            (None, None) => None,
         };
 
         self.execute_with_operation_metric::<T, _>(Operation::Delete, None, |tx| {

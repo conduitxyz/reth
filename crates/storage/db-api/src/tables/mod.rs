@@ -116,6 +116,9 @@ macro_rules! tables {
     (@bool) => { false };
     (@bool $($t:tt)+) => { true };
 
+    (@dupfixed) => { false };
+    (@dupfixed $e:expr) => { $e };
+
     (@view $name:ident $v:ident) => { $v.view::<$name>() };
     (@view $name:ident $v:ident $_subkey:ty) => { $v.view_dupsort::<$name>() };
 
@@ -127,7 +130,7 @@ macro_rules! tables {
         concat!("`", stringify!($value), "`")
     };
 
-    ($($(#[$attr:meta])* table $name:ident$(<$($generic:ident $(= $default:ty)?),*>)? { type Key = $key:ty; type Value = $value:ty; $(type SubKey = $subkey:ty;)? } )*) => {
+    ($($(#[$attr:meta])* table $name:ident$(<$($generic:ident $(= $default:ty)?),*>)? { type Key = $key:ty; type Value = $value:ty; $(type SubKey = $subkey:ty;)? $(const DUPFIXED = $dupfixed:expr;)? } )*) => {
         // Table marker types.
         $(
             $(#[$attr])*
@@ -155,6 +158,7 @@ macro_rules! tables {
             {
                 const NAME: &'static str = table_names::$name;
                 const DUPSORT: bool = tables!(@bool $($subkey)?);
+                const DUPFIXED: bool = tables!(@dupfixed $($dupfixed)?);
 
                 type Key = $key;
                 type Value = $value;
@@ -199,6 +203,15 @@ macro_rules! tables {
                 match self {
                     $(
                         Self::$name => tables!(@bool $($subkey)?),
+                    )*
+                }
+            }
+
+            /// Returns `true` if the table opts into MDBX `DUP_FIXED` storage.
+            pub const fn is_dupfixed(&self) -> bool {
+                match self {
+                    $(
+                        Self::$name => tables!(@dupfixed $($dupfixed)?),
                     )*
                 }
             }
@@ -259,6 +272,10 @@ macro_rules! tables {
 
             fn is_dupsort(&self) -> bool {
                 self.is_dupsort()
+            }
+
+            fn is_dupfixed(&self) -> bool {
+                self.is_dupfixed()
             }
         }
 
@@ -397,6 +414,7 @@ tables! {
         type Key = Address;
         type Value = StorageEntry;
         type SubKey = B256;
+        const DUPFIXED = true;
     }
 
     /// Stores pointers to block changeset with changes for each account key.
@@ -478,6 +496,7 @@ tables! {
         type Key = B256;
         type Value = StorageEntry;
         type SubKey = B256;
+        const DUPFIXED = true;
     }
 
     /// Stores the current state's Merkle Patricia Tree.

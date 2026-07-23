@@ -67,6 +67,9 @@ pub mod common;
 /// Cursor database traits.
 pub mod cursor;
 
+/// Process-wide gate for the D1 shadow flat storage index.
+pub mod flat;
+
 /// Database traits.
 pub mod database;
 

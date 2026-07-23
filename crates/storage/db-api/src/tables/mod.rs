@@ -480,6 +480,19 @@ tables! {
         type SubKey = B256;
     }
 
+    /// Shadow flat mirror of [`HashedStorages`] (D1, opt-in via [`crate::flat`]).
+    ///
+    /// Non-dupsort table keyed by the 64-byte composite [`HashedSlotKey`]
+    /// (`hashed_address ++ hashed_slot`, big-endian). Written alongside [`HashedStorages`] when the
+    /// shadow-flat gate is on so a cold storage read becomes a single point lookup instead of a
+    /// `DUP_SORT` sub-tree descent. [`HashedStorages`] stays canonical (the trie still walks it), so
+    /// state roots are unaffected. A slot is present here iff its value is non-zero, matching
+    /// `DUP_SORT`'s absent-equals-zero semantics.
+    table HashedStoragesFlat {
+        type Key = HashedSlotKey;
+        type Value = CompactU256;
+    }
+
     /// Stores the current state's Merkle Patricia Tree.
     table AccountsTrie {
         type Key = StoredNibbles;
@@ -571,6 +584,49 @@ impl DupSort for PackedStoragesTrie {
     type SubKey = PackedStoredNibblesSubKey;
 }
 
+/// Composite key for [`HashedStoragesFlat`]: `hashed_address (32) ++ hashed_slot (32)`.
+///
+/// Encoded big-endian so lexicographic byte order equals `(hashed_address, hashed_slot)` order:
+/// all slots of one account are prefix-contiguous, and within an account slots sort by hash. The
+/// derived [`Ord`] on the two [`B256`] fields matches the encoded byte order exactly.
+#[derive(Ord, Clone, Copy, Eq, PartialOrd, PartialEq, Debug, Hash, Deserialize, Serialize)]
+pub struct HashedSlotKey {
+    /// `keccak256(address)`.
+    pub hashed_address: B256,
+    /// `keccak256(storage_slot)`.
+    pub hashed_slot: B256,
+}
+
+impl HashedSlotKey {
+    /// Creates a new composite key from a hashed address and hashed slot.
+    pub const fn new(hashed_address: B256, hashed_slot: B256) -> Self {
+        Self { hashed_address, hashed_slot }
+    }
+}
+
+impl Encode for HashedSlotKey {
+    type Encoded = [u8; 64];
+
+    fn encode(self) -> Self::Encoded {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(self.hashed_address.as_slice());
+        buf[32..].copy_from_slice(self.hashed_slot.as_slice());
+        buf
+    }
+}
+
+impl Decode for HashedSlotKey {
+    fn decode(value: &[u8]) -> Result<Self, crate::DatabaseError> {
+        if value.len() != 64 {
+            return Err(crate::DatabaseError::Decode);
+        }
+        Ok(Self {
+            hashed_address: B256::from_slice(&value[..32]),
+            hashed_slot: B256::from_slice(&value[32..]),
+        })
+    }
+}
+
 /// Keys for the `ChainState` table.
 #[derive(Ord, Clone, Eq, PartialOrd, PartialEq, Debug, Deserialize, Serialize, Hash)]
 pub enum ChainStateKey {
@@ -620,6 +676,51 @@ mod tests {
             assert_eq!(format!("{table:?}"), table.name());
             assert_eq!(table.to_string(), table.name());
             assert_eq!(Tables::from_str(table.name()).unwrap(), *table);
+        }
+    }
+
+    #[test]
+    fn hashed_slot_key_roundtrip() {
+        let a = B256::repeat_byte(0xab);
+        let s = B256::repeat_byte(0xcd);
+        let key = HashedSlotKey::new(a, s);
+        let encoded = key.encode();
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(&encoded[..32], a.as_slice());
+        assert_eq!(&encoded[32..], s.as_slice());
+        let decoded = HashedSlotKey::decode(&encoded).unwrap();
+        assert_eq!(decoded, key);
+        assert_eq!(decoded.hashed_address, a);
+        assert_eq!(decoded.hashed_slot, s);
+
+        // wrong length must not decode
+        assert!(HashedSlotKey::decode(&[0u8; 63]).is_err());
+        assert!(HashedSlotKey::decode(&[0u8; 65]).is_err());
+    }
+
+    #[test]
+    fn hashed_slot_key_ordering() {
+        let a = B256::repeat_byte(0x10);
+        let a2 = B256::repeat_byte(0x20);
+        let s1 = B256::from(alloy_primitives::U256::from(1u64));
+        let s2 = B256::from(alloy_primitives::U256::from(2u64));
+
+        // Within one account, key order follows slot order, and encoded-byte order agrees.
+        let k1 = HashedSlotKey::new(a, s1);
+        let k2 = HashedSlotKey::new(a, s2);
+        assert!(k1 < k2);
+        assert!(k1.encode() < k2.encode());
+
+        // A larger account prefix sorts after any slot of a smaller account (prefix grouping).
+        let k_other = HashedSlotKey::new(a2, s1);
+        assert!(k2 < k_other);
+        assert!(k2.encode() < k_other.encode());
+
+        // Ordering of the encoded bytes matches the derived Ord for random keys.
+        for _ in 0..256 {
+            let x = HashedSlotKey::new(B256::random(), B256::random());
+            let y = HashedSlotKey::new(B256::random(), B256::random());
+            assert_eq!(x.cmp(&y), x.encode().cmp(&y.encode()));
         }
     }
 }

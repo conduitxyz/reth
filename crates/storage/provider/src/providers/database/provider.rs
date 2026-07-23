@@ -402,6 +402,54 @@ impl<TX: Debug + Send, N: NodeTypes<ChainSpec: EthChainSpec + 'static>> ChainSpe
     }
 }
 
+impl<TX: DbTx + DbTxMut + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
+    /// Mirrors a hashed-storage slot write into the D1 shadow flat table
+    /// ([`tables::HashedStoragesFlat`]) when the [`reth_db_api::flat`] gate is on.
+    ///
+    /// Preserves `DUP_SORT`'s absent-equals-zero semantics: a non-zero value is `put`, a zero value
+    /// is `delete`d. No-op when the gate is off, so gate-off behaviour is byte-identical to stock.
+    /// Must be called with the same `(hashed_address, hashed_slot, value)` applied to the canonical
+    /// [`tables::HashedStorages`] write so the two tables stay in sync.
+    fn flat_storage_write(
+        &self,
+        hashed_address: B256,
+        hashed_slot: B256,
+        value: StorageValue,
+    ) -> ProviderResult<()> {
+        if !reth_db_api::flat::enabled() {
+            return Ok(());
+        }
+        let key = tables::HashedSlotKey::new(hashed_address, hashed_slot);
+        if value.is_zero() {
+            self.tx_ref().delete::<tables::HashedStoragesFlat>(key, None)?;
+        } else {
+            self.tx_ref().put::<tables::HashedStoragesFlat>(key, value.into())?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every shadow flat ([`tables::HashedStoragesFlat`]) entry for one account, mirroring
+    /// a `DUP_SORT` `delete_current_duplicates` wipe on [`tables::HashedStorages`].
+    ///
+    /// No-op when the [`reth_db_api::flat`] gate is off. Relies on the flat key being
+    /// `hashed_address ++ hashed_slot` big-endian, so an account's slots are prefix-contiguous.
+    fn flat_wipe_account(&self, hashed_address: B256) -> ProviderResult<()> {
+        if !reth_db_api::flat::enabled() {
+            return Ok(());
+        }
+        let mut cursor = self.tx_ref().cursor_write::<tables::HashedStoragesFlat>()?;
+        let mut entry = cursor.seek(tables::HashedSlotKey::new(hashed_address, B256::ZERO))?;
+        while let Some((key, _)) = entry {
+            if key.hashed_address != hashed_address {
+                break;
+            }
+            cursor.delete_current()?;
+            entry = cursor.next()?;
+        }
+        Ok(())
+    }
+}
+
 impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Creates a provider with an inner read-write transaction.
     #[expect(clippy::too_many_arguments)]
@@ -2698,6 +2746,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         for (hashed_address, storage) in sorted_storages {
             if storage.is_wiped() && hashed_storage_cursor.seek_exact(*hashed_address)?.is_some() {
                 hashed_storage_cursor.delete_current_duplicates()?;
+                // D1 shadow-flat: wipe the account's flat entries alongside the DUP_SORT wipe.
+                self.flat_wipe_account(*hashed_address)?;
             }
 
             for (hashed_slot, value) in storage.storage_slots_ref() {
@@ -2713,6 +2763,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 if !entry.value.is_zero() {
                     hashed_storage_cursor.upsert(*hashed_address, &entry)?;
                 }
+
+                // D1 shadow-flat: mirror this slot into the flat table (gated).
+                self.flat_storage_write(*hashed_address, entry.key, entry.value)?;
             }
         }
 
@@ -2811,6 +2864,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                     if !old_storage_value.is_zero() {
                         hashed_storage_cursor.upsert(hashed_address, &storage_entry)?;
                     }
+
+                    // D1 shadow-flat: mirror the unwound slot value into the flat table (gated).
+                    self.flat_storage_write(
+                        hashed_address,
+                        hashed_storage_key,
+                        *old_storage_value,
+                    )?;
                 }
             }
         } else {
@@ -2974,6 +3034,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                     if !old_storage_value.is_zero() {
                         hashed_storage_cursor.upsert(hashed_address, &storage_entry)?;
                     }
+
+                    // D1 shadow-flat: mirror the unwound slot value into the flat table (gated).
+                    self.flat_storage_write(
+                        hashed_address,
+                        hashed_storage_key,
+                        *old_storage_value,
+                    )?;
                 }
             }
 
@@ -3251,6 +3318,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
             if !value.is_zero() {
                 hashed_storage.upsert(hashed_address, &StorageEntry { key, value })?;
             }
+
+            // D1 shadow-flat: mirror this slot into the flat table (gated).
+            self.flat_storage_write(hashed_address, key, value)?;
         }
         Ok(hashed_storage_keys)
     }
@@ -3298,6 +3368,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
                 if !value.is_zero() {
                     hashed_storage_cursor.upsert(hashed_address, &StorageEntry { key, value })?;
                 }
+
+                // D1 shadow-flat: mirror this slot into the flat table (gated).
+                self.flat_storage_write(hashed_address, key, value)?;
                 Ok(())
             })
         })?;

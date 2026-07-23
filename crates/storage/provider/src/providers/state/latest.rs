@@ -2,7 +2,7 @@ use crate::{
     AccountReader, BlockHashReader, HashedPostStateProvider, StateProvider, StateRootProvider,
 };
 use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
-use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
+use reth_db_api::{cursor::DbDupCursorRO, tables, tables::HashedSlotKey, transaction::DbTx};
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
     BytecodeReader, DBProvider, StateProofProvider, StorageRootProvider, StorageSettingsCache,
@@ -58,6 +58,17 @@ impl<'b, Provider: DBProvider> LatestStateProviderRef<'b, Provider> {
         hashed_address: B256,
         hashed_slot: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
+        // D1 shadow-flat read redirect: when the gate is on, serve the read from the flat
+        // composite-key table as a single point lookup instead of a `DUP_SORT` sub-tree descent.
+        // The flat table is kept in sync with `HashedStorages` by `write_hashed_state`, so the
+        // returned value (or absence) is identical to the canonical dup-cursor walk.
+        if reth_db_api::flat::enabled() {
+            return Ok(self
+                .tx()
+                .get::<tables::HashedStoragesFlat>(HashedSlotKey::new(hashed_address, hashed_slot))?
+                .map(|v| v.0));
+        }
+
         let mut cursor = self.tx().cursor_dup_read::<tables::HashedStorages>()?;
         Ok(cursor
             .seek_by_key_subkey(hashed_address, hashed_slot)?
@@ -315,15 +326,19 @@ reth_storage_api::macros::delegate_provider_impls!(LatestStateProvider<Provider>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::create_test_provider_factory;
+    use crate::{test_utils::create_test_provider_factory, StateWriter};
     use alloy_primitives::{address, b256, keccak256, U256};
     use reth_db_api::{
+        cursor::DbDupCursorRO,
+        flat,
         models::StorageSettings,
         tables,
+        tables::HashedSlotKey,
         transaction::{DbTx, DbTxMut},
     };
     use reth_primitives_traits::StorageEntry;
     use reth_storage_api::StorageSettingsCache;
+    use reth_trie::{HashedPostState, HashedStorage};
 
     const fn assert_state_provider<T: StateProvider>() {}
     #[expect(dead_code)]
@@ -438,5 +453,119 @@ mod tests {
         let db = factory.provider().unwrap();
         let provider_ref = LatestStateProviderRef::new(&db);
         assert_eq!(provider_ref.storage(address, slot).unwrap(), None);
+    }
+
+    /// D1 shadow-flat equivalence test.
+    ///
+    /// With the gate ON, write many `(account, slot, value)` through the canonical writer
+    /// ([`StateWriter::write_hashed_state`]) and assert that, for every slot (present, absent,
+    /// zero, and `U256::MAX`), a read through the flat table returns the identical value as a
+    /// direct `DUP_SORT` `seek_by_key_subkey` on the canonical [`tables::HashedStorages`] — and
+    /// that `hashed_storage_lookup` (which redirects to the flat table under the gate) agrees
+    /// with both.
+    ///
+    /// NOTE: the gate is process-wide; run under `nextest` (process-per-test isolation) so it does
+    /// not leak into other tests. The gate is restored to OFF on exit as a best-effort for threaded
+    /// `cargo test` runs.
+    #[test]
+    fn test_d1_shadow_flat_dupsort_equivalence() {
+        flat::set_enabled(true);
+
+        // Three accounts with overlapping slot hashes to exercise prefix grouping.
+        let acct_a = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let acct_b = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let acct_c = b256!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        let slot = |n: u64| B256::from(U256::from(n));
+
+        // (hashed_slot, value) per account. Includes zero (absent semantics) and U256::MAX.
+        let data: Vec<(B256, Vec<(B256, U256)>)> = vec![
+            (
+                acct_a,
+                vec![
+                    (slot(1), U256::from(42u64)),
+                    (slot(2), U256::MAX),
+                    (slot(3), U256::ZERO), // zero => must be absent
+                    (slot(1000), U256::from(1u64)),
+                    (B256::repeat_byte(0xff), U256::from(0x0100u64)),
+                ],
+            ),
+            (
+                acct_b,
+                vec![
+                    (slot(1), U256::from(7u64)), // same slot hash as acct_a, different account
+                    (slot(5), U256::from(u64::MAX)),
+                    (slot(6), U256::ZERO),
+                ],
+            ),
+            (acct_c, vec![(slot(9), U256::from(123456u64))]),
+        ];
+
+        run_equivalence(&data);
+
+        flat::set_enabled(false);
+    }
+
+    /// Runs the write + triple-read equivalence check on a single fresh factory.
+    fn run_equivalence(data: &[(B256, Vec<(B256, U256)>)]) {
+        let factory = create_test_provider_factory();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        let hashed_state = HashedPostState::default()
+            .with_storages(
+                data.iter()
+                    .map(|(addr, slots)| {
+                        (*addr, HashedStorage::from_iter(false, slots.iter().copied()))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_sorted();
+        provider_rw.write_hashed_state(&hashed_state).unwrap();
+        provider_rw.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+
+        // Direct canonical DUP_SORT read (stock path, gate-independent).
+        let dup_read = |a: B256, s: B256| -> Option<U256> {
+            let mut cursor = db.tx_ref().cursor_dup_read::<tables::HashedStorages>().unwrap();
+            cursor.seek_by_key_subkey(a, s).unwrap().filter(|e| e.key == s).map(|e| e.value)
+        };
+        // Direct flat point lookup (gate-independent).
+        let flat_read = |a: B256, s: B256| -> Option<U256> {
+            db.tx_ref()
+                .get::<tables::HashedStoragesFlat>(HashedSlotKey::new(a, s))
+                .unwrap()
+                .map(|v| v.0)
+        };
+
+        for (addr, slots) in data {
+            for (hashed_slot, value) in slots {
+                let expected = if value.is_zero() { None } else { Some(*value) };
+                let dup = dup_read(*addr, *hashed_slot);
+                let flat_direct = flat_read(*addr, *hashed_slot);
+                let lookup = provider_ref.hashed_storage_lookup(*addr, *hashed_slot).unwrap();
+
+                assert_eq!(dup, expected, "dup mismatch for {addr:?}/{hashed_slot:?}");
+                assert_eq!(flat_direct, dup, "flat vs dup mismatch for {addr:?}/{hashed_slot:?}");
+                assert_eq!(
+                    lookup, dup,
+                    "hashed_storage_lookup (flat redirect) vs dup mismatch for {addr:?}/{hashed_slot:?}"
+                );
+            }
+
+            // Absent slot for an existing account => None on both paths.
+            let absent = B256::repeat_byte(0xab);
+            assert_eq!(dup_read(*addr, absent), None);
+            assert_eq!(flat_read(*addr, absent), None);
+            assert_eq!(provider_ref.hashed_storage_lookup(*addr, absent).unwrap(), None);
+        }
+
+        // Entirely absent account => None on both paths.
+        let ghost = B256::repeat_byte(0xee);
+        let ghost_slot = B256::from(U256::from(1u64));
+        assert_eq!(dup_read(ghost, ghost_slot), None);
+        assert_eq!(flat_read(ghost, ghost_slot), None);
+        assert_eq!(provider_ref.hashed_storage_lookup(ghost, ghost_slot).unwrap(), None);
     }
 }

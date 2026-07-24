@@ -7,6 +7,8 @@ use reth_trie_sparse::{ConfigurableSparseTrie, SparseStateTrie};
 use std::sync::Arc;
 use tracing::debug;
 
+use super::multiproof::MultiProofTaskMetrics;
+
 /// Type alias for the sparse trie type used in preservation.
 pub(super) type SparseTrie = SparseStateTrie<ConfigurableSparseTrie, ConfigurableSparseTrie>;
 
@@ -105,7 +107,11 @@ impl PreservedSparseTrie {
     /// If the preserved trie is anchored and the parent state root matches, the pruned
     /// trie structure is reused directly. Otherwise, the trie is cleared but allocations
     /// are preserved to reduce memory overhead.
-    pub(super) fn into_trie_for(self, parent_state_root: B256) -> SparseTrie {
+    pub(super) fn into_trie_for(
+        self,
+        parent_state_root: B256,
+        metrics: &MultiProofTaskMetrics,
+    ) -> SparseTrie {
         match self {
             Self::Anchored { trie, state_root } if state_root == parent_state_root => {
                 debug!(
@@ -122,6 +128,7 @@ impl PreservedSparseTrie {
                     %parent_state_root,
                     "Clearing anchored sparse trie - parent state root mismatch"
                 );
+                metrics.sparse_trie_anchor_mismatch_clears.increment(1);
                 trie.clear();
                 trie
             }

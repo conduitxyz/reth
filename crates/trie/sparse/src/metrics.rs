@@ -44,6 +44,12 @@ pub(crate) struct SparseStateTrieInnerMetrics {
     pub(crate) multiproof_total_account_nodes: Histogram,
     /// Histogram of total storage nodes, including those that were skipped.
     pub(crate) multiproof_total_storage_nodes: Histogram,
+    /// Histogram of hot `(address, slot)` entries evicted from the LFU cache per prune cycle
+    /// (one prune cycle per block). A high value indicates hot-slot cache thrash.
+    pub(crate) hot_slots_evicted: Histogram,
+    /// Histogram of hot account entries evicted from the LFU cache per prune cycle
+    /// (one prune cycle per block).
+    pub(crate) hot_accounts_evicted: Histogram,
 }
 
 /// Metrics for the parallel sparse trie

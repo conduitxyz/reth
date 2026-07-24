@@ -748,8 +748,21 @@ where
         fields(%max_hot_slots, %max_hot_accounts)
     )]
     pub fn prune(&mut self, max_hot_slots: usize, max_hot_accounts: usize) {
+        #[cfg(feature = "metrics")]
+        let (hot_slots_before, hot_accounts_before) =
+            (self.hot_slots_lfu.len(), self.hot_accounts_lfu.len());
+
         self.hot_slots_lfu.decay_and_evict(max_hot_slots);
         self.hot_accounts_lfu.decay_and_evict(max_hot_accounts);
+
+        #[cfg(feature = "metrics")]
+        {
+            let slots_evicted = hot_slots_before.saturating_sub(self.hot_slots_lfu.len());
+            let accounts_evicted = hot_accounts_before.saturating_sub(self.hot_accounts_lfu.len());
+            self.metrics.histograms.hot_slots_evicted.record(slots_evicted as f64);
+            self.metrics.histograms.hot_accounts_evicted.record(accounts_evicted as f64);
+        }
+
         let retained = self.hot_slots_lfu.retained_slots_by_address();
 
         let retained_account_paths: Vec<Nibbles> =

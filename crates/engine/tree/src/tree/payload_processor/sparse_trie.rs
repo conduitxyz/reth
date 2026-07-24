@@ -101,6 +101,9 @@ pub(super) struct SparseTrieCacheTask<A = ConfigurableSparseTrie, S = Configurab
     storage_cache_hits: u64,
     /// Accumulated storage leaf update cache misses.
     storage_cache_misses: u64,
+    /// Accumulated count of storage-trie blinded-node proof targets requested this block
+    /// (on-demand reveals triggered when a leaf update hits a pruned/blinded node).
+    storage_proof_reveals: u64,
     /// Pending proof targets queued for dispatch to proof workers.
     pending_targets: PendingTargets,
     /// Number of pending execution/prewarming updates received but not yet passed to
@@ -158,6 +161,7 @@ where
             account_cache_misses: 0,
             storage_cache_hits: 0,
             storage_cache_misses: 0,
+            storage_proof_reveals: 0,
             pending_targets: Default::default(),
             pending_updates: Default::default(),
             metrics,
@@ -395,10 +399,12 @@ where
         self.metrics.sparse_trie_account_cache_misses.record(self.account_cache_misses as f64);
         self.metrics.sparse_trie_storage_cache_hits.record(self.storage_cache_hits as f64);
         self.metrics.sparse_trie_storage_cache_misses.record(self.storage_cache_misses as f64);
+        self.metrics.sparse_trie_storage_proof_reveals.record(self.storage_proof_reveals as f64);
         self.account_cache_hits = 0;
         self.account_cache_misses = 0;
         self.storage_cache_hits = 0;
         self.storage_cache_misses = 0;
+        self.storage_proof_reveals = 0;
 
         Ok(StateRootComputeOutcome {
             state_root,
@@ -600,6 +606,7 @@ where
             self.storage_cache_misses += updates_len_after as u64;
 
             if !targets.is_empty() {
+                self.storage_proof_reveals += targets.len() as u64;
                 self.pending_targets.extend_storage_targets(address, targets);
             }
         }

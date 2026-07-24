@@ -53,6 +53,35 @@ pub mod sparse_trie;
 
 use preserved_sparse_trie::{PreservedSparseTrie, SharedPreservedSparseTrie};
 
+/// Environment variable overriding the LFU hot-slot budget (max `(address, slot)` pairs retained
+/// across prune cycles). When unset or unparseable, the configured/default value is used, so
+/// default behavior is unchanged. Mirrors the `RETH_STORAGE_FLAT` gated-knob precedent.
+pub const ENV_SPARSE_HOT_SLOTS: &str = "RETH_SPARSE_HOT_SLOTS";
+
+/// Environment variable overriding the LFU hot-account budget (max account addresses retained
+/// across prune cycles). When unset or unparseable, the configured/default value is used.
+pub const ENV_SPARSE_HOT_ACCOUNTS: &str = "RETH_SPARSE_HOT_ACCOUNTS";
+
+/// Applies the `RETH_SPARSE_HOT_SLOTS` override on top of the configured value, if the env var is
+/// set to a parseable `usize`. Read once and cached for the process lifetime.
+fn sparse_hot_slots_budget(configured: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| std::env::var(ENV_SPARSE_HOT_SLOTS).ok().and_then(|v| v.trim().parse().ok()))
+        .unwrap_or(configured)
+}
+
+/// Applies the `RETH_SPARSE_HOT_ACCOUNTS` override on top of the configured value, if the env var
+/// is set to a parseable `usize`. Read once and cached for the process lifetime.
+fn sparse_hot_accounts_budget(configured: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var(ENV_SPARSE_HOT_ACCOUNTS).ok().and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(configured)
+}
+
 /// Default node capacity for shrinking the sparse trie. This is used to limit the number of trie
 /// nodes in allocated sparse tries.
 ///
@@ -178,8 +207,10 @@ where
             precompile_cache_disabled: config.precompile_cache_disabled(),
             precompile_cache_map,
             sparse_state_trie: SharedPreservedSparseTrie::default(),
-            sparse_trie_max_hot_slots: config.sparse_trie_max_hot_slots(),
-            sparse_trie_max_hot_accounts: config.sparse_trie_max_hot_accounts(),
+            sparse_trie_max_hot_slots: sparse_hot_slots_budget(config.sparse_trie_max_hot_slots()),
+            sparse_trie_max_hot_accounts: sparse_hot_accounts_budget(
+                config.sparse_trie_max_hot_accounts(),
+            ),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
             cache_metrics: (!config.disable_cache_metrics())
                 .then(|| CachedStateMetrics::zeroed(CachedStateMetricsSource::Engine)),
@@ -609,7 +640,7 @@ where
                 .record(start.elapsed().as_secs_f64());
 
             let mut sparse_state_trie = preserved
-                .map(|preserved| preserved.into_trie_for(parent_state_root))
+                .map(|preserved| preserved.into_trie_for(parent_state_root, &trie_metrics))
                 .unwrap_or_else(|| {
                     debug!(
                         target: "engine::tree::payload_processor",

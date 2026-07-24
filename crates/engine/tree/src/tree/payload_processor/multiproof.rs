@@ -1,6 +1,6 @@
 //! Multiproof task related functionality.
 
-use metrics::{Gauge, Histogram};
+use metrics::{Counter, Gauge, Histogram};
 use reth_metrics::Metrics;
 
 pub use reth_trie_parallel::state_root_task::{
@@ -46,6 +46,13 @@ pub(crate) struct MultiProofTaskMetrics {
     pub sparse_trie_storage_cache_hits: Histogram,
     /// Number of storage leaf updates that required a new proof (cache misses).
     pub sparse_trie_storage_cache_misses: Histogram,
+
+    /// Per-block count of storage-trie blinded-node proof targets requested (on-demand reveals
+    /// triggered by leaf updates hitting pruned/blinded nodes).
+    pub sparse_trie_storage_proof_reveals: Histogram,
+    /// Monotonic count of preserved-trie clears caused by a parent-state-root / anchor mismatch
+    /// (the retained sparse trie could not be reused for a continuation payload).
+    pub sparse_trie_anchor_mismatch_clears: Counter,
 
     /// Retained memory of the preserved sparse trie cache in bytes.
     pub sparse_trie_retained_memory_bytes: Gauge,

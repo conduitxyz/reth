@@ -2580,3 +2580,59 @@ async fn test_on_backfill_sync_finished_opstack_retriggers_backfill_to_buffered_
 async fn test_on_backfill_sync_finished_eth_retriggers_backfill_to_buffered_finalized() {
     assert_post_backfill_recheck_retriggers_to_buffered_target(EngineApiKind::Ethereum).await;
 }
+
+/// Regression tests for [`changeset_eviction_threshold`].
+///
+/// The behaviour under test: `CHANGESET_CACHE_RETENTION_BLOCKS` is a floor and, historically, there
+/// was no ceiling -- so on a chain whose `finalized` lags the tip indefinitely (an altDA L2, or any
+/// chain during an L1 incident) the changeset cache grew without bound. These pin the ceiling.
+mod changeset_eviction_threshold_tests {
+    use super::super::{changeset_eviction_threshold, CHANGESET_CACHE_RETENTION_BLOCKS};
+
+    #[test]
+    fn no_finalized_uses_retention_floor() {
+        // The documented L2 path: retain exactly CHANGESET_CACHE_RETENTION_BLOCKS.
+        assert_eq!(
+            changeset_eviction_threshold(10_000, None, 0),
+            10_000 - CHANGESET_CACHE_RETENTION_BLOCKS
+        );
+    }
+
+    #[test]
+    fn ceiling_disabled_preserves_original_behaviour() {
+        // finalized far behind the tip and no ceiling => retain all the way back to finalized.
+        // This is the unbounded case observed in production: tip 74_639, finalized 73_350.
+        assert_eq!(changeset_eviction_threshold(74_639, Some(73_350), 0), 73_350);
+    }
+
+    #[test]
+    fn ceiling_clamps_a_lagging_finalized() {
+        // Same inputs, ceiling of 256 => retain 256 blocks instead of 1_289.
+        assert_eq!(changeset_eviction_threshold(74_639, Some(73_350), 256), 74_639 - 256);
+    }
+
+    #[test]
+    fn ceiling_does_not_override_a_healthy_finalized() {
+        // finalized is well within the ceiling, so it must not be clamped: the floor still wins and
+        // we keep the usual 64 blocks rather than evicting up to the ceiling.
+        let t = changeset_eviction_threshold(10_000, Some(9_990), 256);
+        assert_eq!(t, 10_000 - CHANGESET_CACHE_RETENTION_BLOCKS);
+        assert!(t > 10_000 - 256, "ceiling must not force extra retention");
+    }
+
+    #[test]
+    fn ceiling_never_retains_less_than_the_floor() {
+        // A ceiling tighter than the floor must not evict inside the floor's guarantee.
+        let t = changeset_eviction_threshold(10_000, Some(1), 8);
+        assert_eq!(t, 10_000 - 8);
+        // NOTE: with max_blocks < CHANGESET_CACHE_RETENTION_BLOCKS the ceiling does win, which is
+        // why the constant's docs tell operators not to set it below the deepest reorg they want
+        // serviced from memory.
+    }
+
+    #[test]
+    fn saturates_near_genesis() {
+        assert_eq!(changeset_eviction_threshold(10, Some(5), 256), 0);
+        assert_eq!(changeset_eviction_threshold(10, None, 0), 0);
+    }
+}

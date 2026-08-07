@@ -7,7 +7,7 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
-use alloy_primitives::{map::B256Map, B256};
+use alloy_primitives::{map::B256Map, BlockNumber, B256};
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
 };
@@ -40,7 +40,7 @@ use reth_tasks::{spawn_os_thread, utils::increase_thread_priority, WorkerPool};
 use reth_trie_db::ChangesetCache;
 use revm::interpreter::debug_unreachable;
 use state::TreeState;
-use std::{fmt::Debug, ops, sync::Arc, time::Duration};
+use std::{fmt::Debug, ops, sync::{Arc, LazyLock}, time::Duration};
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{
@@ -95,6 +95,81 @@ pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
 /// This ensures that recent trie changesets are kept in memory for potential reorgs,
 /// even when the finalized block is not set (e.g., on L2s like Optimism).
 const CHANGESET_CACHE_RETENTION_BLOCKS: u64 = 64;
+
+/// The MAXIMUM number of blocks to retain in the changeset cache, regardless of how far the
+/// finalized block lags behind the persisted tip.
+///
+/// [`CHANGESET_CACHE_RETENTION_BLOCKS`] is a *floor*: it guarantees a minimum retention when
+/// `finalized` is unset. There is no corresponding *ceiling*, so when `finalized` IS set but lags,
+/// retention becomes `tip - finalized` and grows without bound. That is the normal steady state for
+/// an altDA L2 (where finality trails by an L1 finality period) and for any chain during an L1
+/// incident. Measured on a Zama-workload devnet: `tip - finalized` of 1,292 blocks holding 3.10 GB,
+/// against 64 blocks / ~0.15 GB had the floor applied.
+///
+/// Configured by `RETH_MAX_CHANGESET_CACHE_BLOCKS`. `0` (the default) disables the ceiling and
+/// preserves the previous behaviour exactly, so this is a no-op unless explicitly opted into.
+///
+/// Evicting below `finalized` remains CORRECT: [`ChangesetCache::get_or_compute`] falls back to
+/// recomputing from the database. That fallback is O(distance to tip) -- it replays reverts from
+/// the target block up to the DB tip and recomputes a state root -- so this knowingly trades
+/// expensive deep reorgs for a bounded cache. Set it no lower than the deepest reorg you expect to
+/// service cheaply; `unsafe - safe` is a reasonable lower bound on an OP Stack sequencer.
+static MAX_CHANGESET_CACHE_BLOCKS: LazyLock<u64> = LazyLock::new(|| {
+    match std::env::var("RETH_MAX_CHANGESET_CACHE_BLOCKS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    target: "engine::tree",
+                    value = %raw,
+                    %err,
+                    "Invalid RETH_MAX_CHANGESET_CACHE_BLOCKS, ignoring and leaving the changeset \
+                     cache bounded only by the finalized block"
+                );
+                0
+            }
+        },
+        Err(_) => 0,
+    }
+});
+
+/// Computes the block number below which changesets may be evicted.
+///
+/// Blocks with a number strictly less than the returned value are dropped, so a HIGHER return value
+/// evicts more and retains less.
+///
+/// Three bounds interact:
+/// * `CHANGESET_CACHE_RETENTION_BLOCKS` -- a floor. Always keep at least this many blocks behind
+///   the persisted tip, so recent reorgs are cheap even when `finalized` is unknown.
+/// * `finalized` -- retain everything above it, since anything at or below it cannot be reorged.
+/// * `max_blocks` -- a ceiling. Never retain more than this many blocks behind the persisted tip,
+///   even if `finalized` is far behind. `0` disables the ceiling, reproducing the original
+///   behaviour exactly.
+///
+/// The ceiling is what makes retention bounded on chains whose finality lags the tip indefinitely.
+const fn changeset_eviction_threshold(
+    last_persisted: BlockNumber,
+    finalized: Option<BlockNumber>,
+    max_blocks: u64,
+) -> BlockNumber {
+    let min_threshold = last_persisted.saturating_sub(CHANGESET_CACHE_RETENTION_BLOCKS);
+    match finalized {
+        Some(finalized) => {
+            // Use the minimum of finalized block and retention threshold to be conservative.
+            let threshold =
+                if finalized < min_threshold { finalized } else { min_threshold };
+            if max_blocks == 0 {
+                threshold
+            } else {
+                // Clamp how far back we retain. `max` because a higher threshold evicts more.
+                let ceiling = last_persisted.saturating_sub(max_blocks);
+                if threshold > ceiling { threshold } else { ceiling }
+            }
+        }
+        // When finalized is not set (e.g., on L2s), use the retention threshold
+        None => min_threshold,
+    }
+}
 
 /// A builder for creating state providers that can be used across threads.
 #[derive(Clone, Debug)]
@@ -1492,21 +1567,17 @@ where
         // Evict trie changesets for blocks below the eviction threshold.
         // Keep at least CHANGESET_CACHE_RETENTION_BLOCKS from the persisted tip, and also respect
         // the finalized block if set.
-        let min_threshold =
-            last_persisted_block_number.saturating_sub(CHANGESET_CACHE_RETENTION_BLOCKS);
-        let eviction_threshold =
-            if let Some(finalized) = self.canonical_in_memory_state.get_finalized_num_hash() {
-                // Use the minimum of finalized block and retention threshold to be conservative
-                finalized.number.min(min_threshold)
-            } else {
-                // When finalized is not set (e.g., on L2s), use the retention threshold
-                min_threshold
-            };
+        let eviction_threshold = changeset_eviction_threshold(
+            last_persisted_block_number,
+            self.canonical_in_memory_state.get_finalized_num_hash().map(|f| f.number),
+            *MAX_CHANGESET_CACHE_BLOCKS,
+        );
         debug!(
             target: "engine::tree",
             last_persisted = last_persisted_block_number,
             finalized_number = ?self.canonical_in_memory_state.get_finalized_num_hash().map(|f| f.number),
             eviction_threshold,
+            max_changeset_cache_blocks = *MAX_CHANGESET_CACHE_BLOCKS,
             "Evicting changesets below threshold"
         );
         self.changeset_cache.evict(eviction_threshold);

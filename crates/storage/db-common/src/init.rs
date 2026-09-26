@@ -11,11 +11,12 @@ use reth_chainspec::EthChainSpec;
 use reth_codecs::Compact;
 use reth_config::config::EtlConfig;
 use reth_db_api::{
-    cursor::{DbCursorRW, DbDupCursorRW},
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRW},
     models::{
         storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress, IntegerList,
         ShardedKey,
     },
+    table::DupSort,
     tables,
     transaction::DbTxMut,
     DatabaseError,
@@ -681,6 +682,12 @@ fn parse_accounts(
 /// B-tree traversal). Commits happen every [`STORAGE_COMMIT_THRESHOLD`] storage units to
 /// bound MDBX dirty page accumulation.
 ///
+/// The dump is the authoritative full state at `block`: any storage already present for an
+/// account in the dump (e.g. the genesis alloc written by `init-state --without-evm`) is removed
+/// before the dump's storage is written. Accounts that exist in the database but are absent from
+/// the dump are left untouched; they surface as a state root mismatch in
+/// [`init_from_state_dump`].
+///
 /// NOTE: This function is not idempotent. If the process crashes mid-import, the database
 /// must be wiped before retrying.
 fn dump_state<PF>(
@@ -965,6 +972,22 @@ where
     reth_db_api::transaction::DbTx::commit(provider.into_tx()).map_err(ProviderError::from)
 }
 
+/// Deletes every duplicate stored under `key` in a `DupSort` table.
+///
+/// On `DupSort` tables `upsert`/`append_dup` add a new duplicate instead of replacing an entry with
+/// the same subkey, so pre-existing storage (e.g. from the genesis alloc) has to be removed
+/// explicitly before an account's storage from a state dump is written.
+fn delete_all_duplicates<T, C>(cursor: &mut C, key: T::Key) -> Result<(), DatabaseError>
+where
+    T: DupSort,
+    C: DbCursorRO<T> + DbDupCursorRW<T>,
+{
+    if cursor.seek_exact(key)?.is_some() {
+        cursor.delete_current_duplicates()?;
+    }
+    Ok(())
+}
+
 /// Writes a single account and all its storage to every required DB table directly,
 /// without building intermediary structures.
 ///
@@ -1014,16 +1037,24 @@ fn write_account_to_db<TX: DbTxMut>(
     // account history
     tx.put::<tables::AccountsHistory>(ShardedKey::new(*address, u64::MAX), history_list.clone())?;
 
+    // The dump holds the account's full storage, so drop whatever the database already has for
+    // it (e.g. genesis alloc slots). Without this, `upsert` on the DupSort `HashedStorages` table
+    // keeps the old entry next to the new one, and `append_dup` on `PlainStorageState` fails when
+    // an existing slot sorts after a dump slot.
+    let mut hashed_storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
+    let mut plain_storage_cursor = tx.cursor_dup_write::<tables::PlainStorageState>()?;
+    delete_all_duplicates(&mut hashed_storage_cursor, hashed_address)?;
+    delete_all_duplicates(&mut plain_storage_cursor, *address)?;
+
     // storage entries
     if let Some(storage) = &genesis_account.storage {
-        let mut hashed_storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
-        let mut plain_storage_cursor = tx.cursor_dup_write::<tables::PlainStorageState>()?;
         let mut storage_cs_cursor = tx.cursor_dup_write::<tables::StorageChangeSets>()?;
 
         for (&key, &value) in storage {
             let value_u256 = U256::from_be_bytes(value.0);
 
-            // plain storage — sorted by (address, key), use append_dup
+            // plain storage — no entries left for this address and storage is sorted by key, so
+            // append_dup is valid (it only orders duplicates within the same address)
             plain_storage_cursor.append_dup(*address, StorageEntry { key, value: value_u256 })?;
 
             // hashed storage — unsorted keccak order, use upsert
@@ -1096,9 +1127,13 @@ where
     history_batch
         .put::<tables::AccountsHistory>(ShardedKey::new(*address, u64::MAX), history_list)?;
 
-    if let Some(storage) = &genesis_account.storage {
-        let mut hashed_storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
+    // The dump holds the account's full storage, so drop whatever the database already has for
+    // it (e.g. genesis alloc slots). Without this, `upsert` on the DupSort `HashedStorages` table
+    // keeps the old entry next to the new one and reads may return the stale value.
+    let mut hashed_storage_cursor = tx.cursor_dup_write::<tables::HashedStorages>()?;
+    delete_all_duplicates(&mut hashed_storage_cursor, hashed_address)?;
 
+    if let Some(storage) = &genesis_account.storage {
         for (&key, &value) in storage {
             let value_u256 = U256::from_be_bytes(value.0);
 
@@ -1504,6 +1539,166 @@ mod tests {
             .unwrap();
         assert_eq!(account_offsets.len() as u64, block - account_file_start + 1);
         assert_eq!(storage_offsets.len() as u64, block - storage_file_start + 1);
+    }
+
+    /// Imports a state dump over a database whose genesis alloc already holds storage for the
+    /// same accounts, as `init-state --without-evm` does, and checks that the dump fully replaces
+    /// the existing storage of every account it contains.
+    fn assert_dump_state_replaces_genesis_storage(settings: StorageSettings) {
+        let dump_only = Address::with_last_byte(1);
+        let overlapping = Address::with_last_byte(2);
+        let storage_cleared = Address::with_last_byte(3);
+        let slot = B256::with_last_byte;
+
+        let genesis_alloc = BTreeMap::from([
+            (
+                overlapping,
+                GenesisAccount {
+                    balance: U256::from(1),
+                    storage: Some(BTreeMap::from([
+                        // overwritten by the dump
+                        (slot(1), B256::with_last_byte(0x11)),
+                        // absent from the dump, must not survive the import
+                        (slot(2), B256::with_last_byte(0x12)),
+                        // present in the dump with the same value
+                        (slot(4), B256::with_last_byte(0x14)),
+                    ])),
+                    ..Default::default()
+                },
+            ),
+            (
+                storage_cleared,
+                GenesisAccount {
+                    storage: Some(BTreeMap::from([(slot(7), B256::with_last_byte(0x17))])),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let dump_alloc = BTreeMap::from([
+            (
+                dump_only,
+                GenesisAccount {
+                    balance: U256::from(5),
+                    storage: Some(BTreeMap::from([(slot(5), B256::with_last_byte(0x25))])),
+                    ..Default::default()
+                },
+            ),
+            (
+                overlapping,
+                GenesisAccount {
+                    balance: U256::from(2),
+                    storage: Some(BTreeMap::from([
+                        (slot(1), B256::with_last_byte(0x21)),
+                        (slot(3), B256::with_last_byte(0x23)),
+                        (slot(4), B256::with_last_byte(0x14)),
+                    ])),
+                    ..Default::default()
+                },
+            ),
+            // account exists in the dump but no longer has any storage
+            (storage_cleared, GenesisAccount { balance: U256::from(3), ..Default::default() }),
+        ]);
+
+        let expected_state_root = reth_trie::root::state_root_ref_unhashed(&dump_alloc);
+
+        let chain_spec = Arc::new(ChainSpec {
+            chain: Chain::from_id(1),
+            genesis: Genesis { alloc: genesis_alloc, ..Default::default() },
+            hardforks: Default::default(),
+            paris_block_and_final_difficulty: None,
+            deposit_contract: None,
+            ..Default::default()
+        });
+        let factory = create_test_provider_factory_with_chain_spec(chain_spec);
+        init_genesis_with_settings(&factory, settings).unwrap();
+        factory.set_storage_settings_cache(settings);
+
+        let input = dump_alloc
+            .iter()
+            .map(|(address, account)| {
+                serde_json::to_string(&GenesisAccountWithAddress {
+                    genesis_account: account.clone(),
+                    address: *address,
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collector = parse_accounts(input.as_bytes(), EtlConfig::new(None, 128)).unwrap();
+        dump_state(collector, &factory, 10).unwrap();
+
+        let expected_hashed_storage = |address: Address| {
+            let mut entries = dump_alloc[&address]
+                .storage
+                .iter()
+                .flatten()
+                .map(|(key, value)| {
+                    (
+                        keccak256(address),
+                        StorageEntry { key: keccak256(key), value: U256::from_be_bytes(value.0) },
+                    )
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, entry)| entry.key);
+            entries
+        };
+        let expected_plain_storage = |address: Address| {
+            dump_alloc[&address]
+                .storage
+                .iter()
+                .flatten()
+                .map(|(key, value)| {
+                    (address, StorageEntry { key: *key, value: U256::from_be_bytes(value.0) })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        {
+            let provider = factory.provider().unwrap();
+            let tx = provider.tx_ref();
+
+            let hashed_storage =
+                collect_table_entries::<DatabaseEnv, tables::HashedStorages>(tx).unwrap();
+            for address in [dump_only, overlapping, storage_cleared] {
+                let actual = hashed_storage
+                    .iter()
+                    .filter(|(hashed_address, _)| *hashed_address == keccak256(address))
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected_hashed_storage(address), "hashed storage of {address}");
+            }
+            assert_eq!(hashed_storage.len(), 4);
+
+            let plain_storage =
+                collect_table_entries::<DatabaseEnv, tables::PlainStorageState>(tx).unwrap();
+            if settings.storage_v2 {
+                assert!(plain_storage.is_empty());
+            } else {
+                let expected = [dump_only, overlapping, storage_cleared]
+                    .into_iter()
+                    .flat_map(expected_plain_storage)
+                    .collect::<Vec<_>>();
+                assert_eq!(plain_storage, expected);
+            }
+        }
+
+        {
+            let provider_rw = factory.database_provider_rw().unwrap();
+            provider_rw.tx_ref().clear::<tables::AccountsTrie>().unwrap();
+            provider_rw.tx_ref().clear::<tables::StoragesTrie>().unwrap();
+            provider_rw.commit().unwrap();
+        }
+        assert_eq!(compute_state_root_chunked(&factory).unwrap(), expected_state_root);
+    }
+
+    #[test]
+    fn dump_state_replaces_genesis_storage_v1() {
+        assert_dump_state_replaces_genesis_storage(StorageSettings::v1());
+    }
+
+    #[test]
+    fn dump_state_replaces_genesis_storage_v2() {
+        assert_dump_state_replaces_genesis_storage(StorageSettings::v2());
     }
 
     #[test]

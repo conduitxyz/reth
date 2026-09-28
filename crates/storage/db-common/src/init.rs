@@ -682,11 +682,11 @@ fn parse_accounts(
 /// B-tree traversal). Commits happen every [`STORAGE_COMMIT_THRESHOLD`] storage units to
 /// bound MDBX dirty page accumulation.
 ///
-/// The dump is the authoritative full state at `block`, so the plain and hashed state tables are
-/// cleared first: the genesis alloc written by `init-state --without-evm` must not survive, neither
-/// for accounts the dump overwrites nor for accounts it doesn't contain (on zircuit-garfield-testnet
-/// 2,311 of the 2,331 genesis accounts are absent from the dump). Bytecodes, history indices and
-/// change sets are left as they are.
+/// The dump is the authoritative full state at `block`: any storage already present for an
+/// account in the dump (e.g. the genesis alloc written by `init-state --without-evm`) is removed
+/// before the dump's storage is written. Accounts that exist in the database but are absent from
+/// the dump are left untouched; they surface as a state root mismatch in
+/// [`init_from_state_dump`].
 ///
 /// NOTE: This function is not idempotent. If the process crashes mid-import, the database
 /// must be wiped before retrying.
@@ -702,17 +702,6 @@ where
         + RocksDBProviderFactory
         + NodePrimitivesProvider,
 {
-    // Drop the state `init_genesis` wrote so only the dump's accounts and storage remain.
-    {
-        let provider_rw = provider_factory.database_provider_rw()?;
-        let tx = provider_rw.tx_ref();
-        tx.clear::<tables::PlainAccountState>()?;
-        tx.clear::<tables::PlainStorageState>()?;
-        tx.clear::<tables::HashedAccounts>()?;
-        tx.clear::<tables::HashedStorages>()?;
-        commit_mdbx_only(provider_rw)?;
-    }
-
     let storage_settings = provider_factory.database_provider_rw()?.cached_storage_settings();
     if storage_settings.storage_v2 {
         return dump_state_v2(collector, provider_factory, block)
@@ -1559,8 +1548,6 @@ mod tests {
         let dump_only = Address::with_last_byte(1);
         let overlapping = Address::with_last_byte(2);
         let storage_cleared = Address::with_last_byte(3);
-        // in the genesis alloc only; the import must drop it entirely
-        let genesis_only = Address::with_last_byte(4);
         let slot = B256::with_last_byte;
 
         let genesis_alloc = BTreeMap::from([
@@ -1583,14 +1570,6 @@ mod tests {
                 storage_cleared,
                 GenesisAccount {
                     storage: Some(BTreeMap::from([(slot(7), B256::with_last_byte(0x17))])),
-                    ..Default::default()
-                },
-            ),
-            (
-                genesis_only,
-                GenesisAccount {
-                    balance: U256::from(9),
-                    storage: Some(BTreeMap::from([(slot(8), B256::with_last_byte(0x18))])),
                     ..Default::default()
                 },
             ),
@@ -1689,24 +1668,6 @@ mod tests {
                 assert_eq!(actual, expected_hashed_storage(address), "hashed storage of {address}");
             }
             assert_eq!(hashed_storage.len(), 4);
-
-            let hashed_accounts =
-                collect_table_entries::<DatabaseEnv, tables::HashedAccounts>(tx).unwrap();
-            assert!(
-                hashed_accounts.iter().all(|(hashed_address, _)| *hashed_address != keccak256(genesis_only)),
-                "genesis-only account survived the import"
-            );
-            assert_eq!(hashed_accounts.len(), dump_alloc.len());
-            let plain_accounts =
-                collect_table_entries::<DatabaseEnv, tables::PlainAccountState>(tx).unwrap();
-            if settings.storage_v2 {
-                assert!(plain_accounts.is_empty());
-            } else {
-                assert_eq!(
-                    plain_accounts.iter().map(|(address, _)| *address).collect::<Vec<_>>(),
-                    dump_alloc.keys().copied().collect::<Vec<_>>()
-                );
-            }
 
             let plain_storage =
                 collect_table_entries::<DatabaseEnv, tables::PlainStorageState>(tx).unwrap();

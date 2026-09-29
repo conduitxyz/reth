@@ -65,7 +65,8 @@ jobs:
 
   state:
     name: Ethereum state tests
-    runs-on: ${{ github.repository == 'paradigmxyz/reth' && 'depot-ubuntu-latest-8' || 'ubuntu-latest' }}
+    # Too heavy for the default runner: on conduitxyz/reth it hit the 30m timeout or was killed.
+    runs-on: ${{ github.repository == 'paradigmxyz/reth' && 'depot-ubuntu-latest-8' || github.repository == 'conduitxyz/reth' && 'ubuntu-latest-16core' || 'ubuntu-latest' }}
     permissions:
       contents: read
     env:
